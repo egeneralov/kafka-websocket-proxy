@@ -2,20 +2,24 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/twmb/franz-go/pkg/kgo"
 	"log"
 	"net/http"
+	"sync"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+	}
+	locker = make(map[string]sync.Mutex)
+)
 
 func reader(conn *websocket.Conn, clientName, topicName string) {
+	mutex := locker[clientName]
 	seeds := []string{
 		"localhost:9092",
 	}
@@ -25,38 +29,57 @@ func reader(conn *websocket.Conn, clientName, topicName string) {
 		kgo.ConsumeTopics(topicName),
 	)
 	if err != nil {
+		mutex.Lock()
 		conn.WriteJSON(struct {
 			Error string `json:"error"`
 		}{
 			Error: err.Error(),
 		})
+		mutex.Unlock()
 		return
 	}
-	defer cl.Close()
+	defer func() {
+		cl.Close()
+		conn.Close()
+	}()
 
 	go func() {
 		for {
 			fetches := cl.PollFetches(context.TODO())
 			if errs := fetches.Errors(); len(errs) > 0 {
+				mutex.Lock()
 				conn.WriteJSON(struct {
 					Error []kgo.FetchError `json:"fetch_error"`
 				}{
 					Error: errs,
 				})
-				fmt.Println(errs)
+				mutex.Unlock()
+				log.Println(errs)
+				return
 			}
 			iter := fetches.RecordIter()
 			for !iter.Done() {
 				record := iter.Next()
-				//fmt.Println(string(record.Value), "from an iterator!")
-				//conn.WriteJSON(record)
-				conn.WriteMessage(1, record.Value)
+				//conn.WriteMessage(1, record.Value)
+				mutex.Lock()
+				conn.WriteJSON(struct {
+					Message string `json:"message"`
+					CG      string `json:"consumer_group_name"`
+					Topic   string `json:"topic_name"`
+					Value   string `json:"value"`
+				}{
+					Message: "received from kafka",
+					CG:      clientName,
+					Topic:   topicName,
+					Value:   string(record.Value),
+				})
+				mutex.Unlock()
 			}
 		}
 	}()
 
 	for {
-		messageType, message, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			//log.Println(err)
 			conn.WriteJSON(struct {
@@ -66,20 +89,44 @@ func reader(conn *websocket.Conn, clientName, topicName string) {
 			})
 			return
 		}
-		fmt.Println("received from ws client", messageType, string(message))
+		//log.Println("received from ws client", messageType, string(message))
 
 		record := &kgo.Record{
 			Topic: topicName,
 			Value: message,
 		}
-		cl.Produce(context.TODO(), record, func(_ *kgo.Record, err error) {
+		cl.Produce(context.TODO(), record, func(nrecord *kgo.Record, err error) {
 			if err != nil {
-				//fmt.Printf("record had a produce error: %v\n", err)
+				//log.Printf("record had a produce error: %v\n", err)
+				mutex.Lock()
 				conn.WriteJSON(struct {
 					Error string `json:"error"`
 				}{
 					Error: err.Error(),
 				})
+				mutex.Unlock()
+			} else {
+				mutex.Lock()
+				conn.WriteJSON(struct {
+					Message       string `json:"message"`
+					Topic         string `json:"topic_name"`
+					Timestamp     int64  `json:"timestamp"`
+					Partition     int32  `json:"partition"`
+					ProducerEpoch int16  `json:"producer_epoch"`
+					ProducerID    int64  `json:"producer_id"`
+					LeaderEpoch   int32  `json:"leader_epochEpoch"`
+					Offset        int64  `json:"offset"`
+				}{
+					Message:       "produced message",
+					Topic:         topicName,
+					Timestamp:     nrecord.Timestamp.Unix(),
+					Partition:     nrecord.Partition,
+					ProducerEpoch: nrecord.ProducerEpoch,
+					ProducerID:    nrecord.ProducerID,
+					LeaderEpoch:   nrecord.LeaderEpoch,
+					Offset:        nrecord.Offset,
+				})
+				mutex.Unlock()
 			}
 		})
 
@@ -94,7 +141,7 @@ func wsEndpoint(w http.ResponseWriter, r *http.Request) {
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
 
@@ -102,13 +149,21 @@ func wsEndpoint(w http.ResponseWriter, r *http.Request) {
 	client_name := params["name"]
 	topic_name := params["topic"]
 
-	//ws.WriteJSON(struct {
-	//	Name  string `json:"msg"`
-	//	Topic string `json:"topic"`
-	//}{
-	//	Name:  client_name,
-	//	Topic: topic_name,
-	//})
+	if client_name == "" || topic_name == "" {
+		w.WriteHeader(400)
+		return
+	}
+	locker[client_name] = sync.Mutex{}
+
+	ws.WriteJSON(struct {
+		Message string `json:"message"`
+		CG      string `json:"consumer_group_name"`
+		Topic   string `json:"topic_name"`
+	}{
+		Message: "Starting consume",
+		CG:      client_name,
+		Topic:   topic_name,
+	})
 
 	reader(ws, client_name, topic_name)
 }
@@ -118,6 +173,6 @@ func main() {
 	rtr.HandleFunc("/ws/{name:[a-z]+}/{topic:[a-z]+}/", wsEndpoint)
 	http.Handle("/", rtr)
 	bindAddress := ":8080"
-	fmt.Println("binding to", bindAddress)
+	log.Println("binding to", bindAddress)
 	log.Fatal(http.ListenAndServe(bindAddress, nil))
 }
